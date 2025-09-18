@@ -6,6 +6,15 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+// Define AF_INET if not in vmlinux.h
+#ifndef AF_INET
+#define AF_INET 2
+#endif
+
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
+
 // Must match Go Event struct exactly - 37 bytes
 struct conn_event {
     __u32 pid;       // 4 bytes
@@ -35,11 +44,8 @@ struct {
 
 // Helper to get current task info
 static __always_inline void get_task_info(struct conn_event *evt) {
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    
     evt->pid = bpf_get_current_pid_tgid() >> 32;
     evt->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
-    
     bpf_get_current_comm(&evt->comm, sizeof(evt->comm));
 }
 
@@ -82,8 +88,8 @@ int trace_tcp_connect(struct pt_regs *ctx) {
     return 0;
 }
 
-// Kprobe for inbound TCP connections (inet_csk_accept)
-SEC("kprobe/inet_csk_accept") 
+// Kretprobe for inbound TCP connections (inet_csk_accept return)
+SEC("kretprobe/inet_csk_accept")
 int trace_tcp_accept(struct pt_regs *ctx) {
     struct sock *sk = (struct sock *)PT_REGS_RC(ctx);
     if (!sk) return 0;
@@ -122,31 +128,61 @@ int trace_tcp_accept(struct pt_regs *ctx) {
     return 0;
 }
 
-// Tracepoint fallback for connect syscall
-SEC("tracepoint/syscalls/sys_enter_connect")
-int trace_connect_syscall(struct syscalls_enter_connect_args *ctx) {
+// Alternative: Use raw tracepoint for connect syscall
+// This avoids the struct definition issue
+SEC("raw_tracepoint/sys_enter")
+int trace_sys_enter(struct bpf_raw_tracepoint_args *ctx) {
+    // Get syscall number
+    unsigned long syscall_id = ctx->args[1];
+    
+    // Check if it's connect syscall (42 on x86_64)
+    // You might need to adjust this for your architecture
+    #ifdef __x86_64__
+    if (syscall_id != 42) // __NR_connect
+        return 0;
+    #endif
+    
     struct conn_event evt = {};
-    struct sockaddr_in *addr = (struct sockaddr_in *)ctx->uservaddr;
+    get_task_info(&evt);
     
-    if (!addr) return 0;
+    // For raw tracepoint, we have limited access to arguments
+    // This is a simplified version
+    evt.direction = 0; // Outbound
     
-    // Check if IPv4
-    __u16 family;
-    bpf_core_read(&family, sizeof(family), &addr->sin_family);
-    if (family != AF_INET) return 0;
+    // Send basic event (without full address details)
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+    
+    return 0;
+}
+
+// Alternative kprobe for socket operations
+SEC("kprobe/__sys_connect")
+int trace_sys_connect(struct pt_regs *ctx) {
+    struct conn_event evt = {};
     
     // Get process info
     get_task_info(&evt);
     
-    // Read destination address
-    bpf_core_read(&evt.daddr, sizeof(evt.daddr), &addr->sin_addr.s_addr);
-    bpf_core_read(&evt.dport, sizeof(evt.dport), &addr->sin_port);
+    // Get file descriptor (first argument)
+    int fd = (int)PT_REGS_PARM1(ctx);
     
-    // Source will be determined by kernel, set to 0 for now
-    evt.saddr = 0;
-    evt.sport = 0;
+    // For a more complete implementation, you would need to:
+    // 1. Look up the file descriptor to get the socket
+    // 2. Extract address information from the sockaddr structure
+    // For now, we'll just track that a connection was attempted
     
     evt.direction = 0; // Outbound
+    
+    // Basic deduplication based on PID
+    __u64 conn_key = (__u64)evt.pid;
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *last_seen = bpf_map_lookup_elem(&conn_track, &conn_key);
+    
+    if (last_seen && (now - *last_seen) < 100000000) { // 100ms cooldown
+        return 0;
+    }
+    
+    bpf_map_update_elem(&conn_track, &conn_key, &now, BPF_ANY);
     
     // Send event
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
@@ -154,30 +190,18 @@ int trace_connect_syscall(struct syscalls_enter_connect_args *ctx) {
     return 0;
 }
 
-// Optional: Track UDP connections via sendto
-SEC("tracepoint/syscalls/sys_enter_sendto")
-int trace_udp_sendto(struct syscalls_enter_sendto_args *ctx) {
+// Simplified UDP tracking via kprobe
+SEC("kprobe/udp_sendmsg")
+int trace_udp_send(struct pt_regs *ctx) {
     struct conn_event evt = {};
-    struct sockaddr_in *addr = (struct sockaddr_in *)ctx->addr;
-    
-    if (!addr) return 0;
-    
-    // Check if IPv4
-    __u16 family;
-    bpf_core_read(&family, sizeof(family), &addr->sin_family);
-    if (family != AF_INET) return 0;
     
     // Get process info
     get_task_info(&evt);
     
-    // Read destination
-    bpf_core_read(&evt.daddr, sizeof(evt.daddr), &addr->sin_addr.s_addr);
-    bpf_core_read(&evt.dport, sizeof(evt.dport), &addr->sin_port);
-    
     evt.direction = 0; // Outbound UDP
     
     // Basic deduplication for UDP
-    __u64 conn_key = ((__u64)evt.pid << 32) | evt.dport;
+    __u64 conn_key = (__u64)evt.pid;
     __u64 now = bpf_ktime_get_ns();
     __u64 *last_seen = bpf_map_lookup_elem(&conn_track, &conn_key);
     
